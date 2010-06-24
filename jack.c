@@ -25,6 +25,7 @@
 #endif
 #include <stdio.h>
 #include <string.h>
+/*
 #if HAVE_SYS_SOUNDCARD_H
 #include <sys/soundcard.h>
 #else
@@ -32,7 +33,10 @@
 #endif
 #include <fcntl.h>
 #include <sys/ioctl.h>
+*/
 #include <stdlib.h>
+#include <jack/jack.h>
+#include "bio2jack.h"
 #include "../../deadbeef.h"
 
 //#define trace(...) { fprintf(stderr, __VA_ARGS__); }
@@ -41,126 +45,102 @@
 static DB_output_t plugin;
 DB_functions_t *deadbeef;
 
-static intptr_t oss_tid;
-static int oss_terminate;
-static int oss_rate = 44100;
+static intptr_t pjack_tid;
+static int pjack_terminate;
+unsigned int pjack_rate;
 static int state;
-static int fd;
+int jack_device;
+static int bits_per_sample = 16;
+static int channels = 2;
 static uintptr_t mutex;
 
-#define BLOCKSIZE 8192
+#define jack_blocksize 1024
 
 static void
-oss_thread (void *context);
+pjack_thread (void *context);
 
 static int
-oss_callback (char *stream, int len);
+pjack_callback (char *stream, int len);
 
 static int
-oss_init (void) {
-    trace ("oss_init\n");
+pjack_init (void) {
+    trace ("pjack_init\n");
     state = OUTPUT_STATE_STOPPED;
-    oss_terminate = 0;
+    pjack_terminate = 0;
+    
     mutex = 0;
-
-    // prepare oss for playback
-    const char *name = deadbeef->conf_get_str ("oss.device", "/dev/dsp");
-    fd = open (name, O_WRONLY);
-    if (fd == -1) {
-        fprintf (stderr, "oss: failed to open file %s\n", name);
-        perror (name);
-        plugin.free ();
+    JACK_Init();
+    JACK_SetClientName("deadbeef");
+    int retval = JACK_Open(&jack_device, bits_per_sample, &pjack_rate, channels);
+    if (retval) {
+	perror("failed to open jack with Jack_Open");
+	plugin.free();
+	return -1;
+    } 
+    fprintf(stderr, "jack_device: %d,pjack_rate: %d", jack_device, pjack_rate);
+    /*    jack_options_t options = JackNoStartServer;
+    jack_status_t status;
+    jack_client_t *client = jack_client_open ("test", options, &status, NULL);
+    if (client == NULL)
+    {
+        perror("jack_client_open() failed.");
+        if (status & JackServerFailed)
+        {
+            perror("Unable to connect to JACK server.");
+        }
         return -1;
-    }
-
-#if OSS_VERSION>=0x040000
-/*
-    int cooked = 1;
-    ioctl (fd, SNDCTL_DSP_COOKEDMODE, &cooked);
-    trace ("oss: cooked_mode=%d\n", cooked);
-
-    int policy = 3;
-    ioctl (fd, SNDCTL_DSP_POLICY, &policy);
-    trace ("oss: policy=%d\n", policy);
-*/
-#endif
-
-    int fmt = AFMT_S16_NE;
-    if (ioctl (fd, SNDCTL_DSP_SETFMT, &fmt) == -1) {
-        fprintf (stderr, "oss: failed to set format\n");
-        perror ("SNDCTL_DSP_SETFMT");
-        plugin.free ();
-        return -1;
-    }
-
-    if (fmt != AFMT_S16_NE) {
-        fprintf (stderr, "oss: device doesn't support 16 bit sample format\n");
-        plugin.free ();
-        return -1;
-    }
-
-    int channels = 2;
-    if (ioctl (fd, SNDCTL_DSP_CHANNELS, &channels) == -1) {
-        fprintf (stderr, "oss: failed to set channels\n");
-        perror ("SNDCTL_DSP_CHANNELS");
-        plugin.free ();
-        return -1;
-    }
-    if (channels != 2) {
-        fprintf (stderr, "oss: device doesn't support stereo output\n");
-        plugin.free ();
-        return -1;
-    }
-
-    if (ioctl (fd, SNDCTL_DSP_SPEED, &oss_rate) == -1) {
-        fprintf (stderr, "oss: failed to set samplerate\n");
-        perror ("SNDCTL_DSP_CHANNELS");
-        plugin.free ();
-        return -1;
-    }
-
-    trace ("oss: samplerate: %d\n", oss_rate);
-
+	}
+      pjack_rate = jack_get_sample_rate(client);
+      jack_client_close (client);    */
+              pjack_rate = 44100;
+    // prepare jack for playback
+    
     mutex = deadbeef->mutex_create ();
 
-    oss_tid = deadbeef->thread_start (oss_thread, NULL);
+    pjack_tid = deadbeef->thread_start (pjack_thread, NULL);
     return 0;
 }
 
 static int
-oss_change_rate (int rate) {
-    if (!fd) {
-        return oss_rate;
-    }
-    if (rate == oss_rate) {
-        trace ("oss_change_rate %d: ignored\n", rate);
+pjack_change_rate (int rate) {
+  /*    if (!fd) {
+        return pjack_rate;
+	}*/
+
+    if (rate == pjack_rate) {
+        trace ("pjack_change_rate %d: ignored\n", rate);
         return rate;
+    } else {
+	perror("can't  change samplerate");
+	return pjack_rate;
     }
-    deadbeef->mutex_lock (mutex);
+
+/*    deadbeef->mutex_lock (mutex);
     if (ioctl (fd, SNDCTL_DSP_SPEED, &rate) == -1) {
         fprintf (stderr, "oss: can't switch to %d samplerate\n", rate);
         perror ("SNDCTL_DSP_CHANNELS");
         plugin.free ();
         return -1;
     }
-    oss_rate = rate;
+    pjack_rate = rate;
     deadbeef->mutex_unlock (mutex);
-    return oss_rate;
+  */
+    
 }
 
 static int
-oss_free (void) {
-    trace ("oss_free\n");
-    if (!oss_terminate) {
-        if (oss_tid) {
-            oss_terminate = 1;
-            deadbeef->thread_join (oss_tid);
+pjack_free (void) {
+    trace ("pjack_free\n");
+    if (!pjack_terminate) {
+        if (pjack_tid) {
+            pjack_terminate = 1;
+            deadbeef->thread_join (pjack_tid);
         }
-        oss_tid = 0;
+        pjack_tid = 0;
         state = OUTPUT_STATE_STOPPED;
-        oss_terminate = 0;
-        if (fd) {
-            close (fd);
+        pjack_terminate = 0;
+        if (jack_device) {
+            JACK_Close (jack_device);
         }
         if (mutex) {
             deadbeef->mutex_free (mutex);
@@ -171,9 +151,9 @@ oss_free (void) {
 }
 
 static int
-oss_play (void) {
-    if (!oss_tid) {
-        if (oss_init () < 0) {
+pjack_play (void) {
+    if (!pjack_tid) {
+        if (pjack_init () < 0) {
             return -1;
         }
     }
@@ -182,29 +162,29 @@ oss_play (void) {
 }
 
 static int
-oss_stop (void) {
+pjack_stop (void) {
     state = OUTPUT_STATE_STOPPED;
     deadbeef->streamer_reset (1);
-    return oss_free();
+    return pjack_free();
 }
 
 static int
-oss_pause (void) {
+pjack_pause (void) {
     if (state == OUTPUT_STATE_STOPPED) {
         return -1;
     }
     // set pause state
     state = OUTPUT_STATE_PAUSED;
-    return oss_free();
+    return pjack_free();
 }
 
 static int
-oss_unpause (void) {
+pjack_unpause (void) {
     // unset pause state
     if (state == OUTPUT_STATE_PAUSED) {
 
-       if (!oss_tid) {
-          if(oss_init() < 0) {
+       if (!pjack_tid) {
+          if(pjack_init() < 0) {
              return -1;
           }
        }
@@ -215,22 +195,22 @@ oss_unpause (void) {
 }
 
 static int
-oss_get_rate (void) {
-    return oss_rate;
+pjack_get_rate (void) {
+    return pjack_rate;
 }
 
 static int
-oss_get_bps (void) {
-    return 16;
+pjack_get_bps (void) {
+    return bits_per_sample;
 }
 
 static int
-oss_get_channels (void) {
-    return 2;
+pjack_get_channels (void) {
+    return channels;
 }
 
 static int
-oss_get_endianness (void) {
+pjack_get_endianness (void) {
 #if WORDS_BIGENDIAN
     return 1;
 #else
@@ -239,64 +219,69 @@ oss_get_endianness (void) {
 }
 
 static void
-oss_thread (void *context) {
+pjack_thread (void *context) {
 #ifdef __linux__
-    prctl (PR_SET_NAME, "deadbeef-oss", 0, 0, 0, 0);
+    prctl (PR_SET_NAME, "deadbeef-jack", 0, 0, 0, 0);
 #endif
     for (;;) {
-        if (oss_terminate) {
+        if (pjack_terminate) {
             break;
         }
         if (state != OUTPUT_STATE_PLAYING || !deadbeef->streamer_ok_to_read (-1)) {
-            usleep (10000);
+            usleep (1000);
             continue;
         }
 
         int res = 0;
-        
-        char buf[BLOCKSIZE];
-        int write_size = oss_callback (buf, sizeof (buf));
-        deadbeef->mutex_lock (mutex);
+	//	perror("pjack_thread");
+        char buf[jack_blocksize];
+	int write_size = pjack_callback (buf, sizeof (buf));
+	if ( write_size != jack_blocksize ) fprintf (stderr, "oops, size is %i", write_size);
+	deadbeef->mutex_lock (mutex);
         if ( write_size > 0 )
-           res = write (fd, buf, write_size);
+	  res = JACK_Write (jack_device, (unsigned char*) buf, write_size);
 
-        deadbeef->mutex_unlock (mutex);
+	deadbeef->mutex_unlock (mutex);
         if (res != write_size) {
-            perror ("oss write");
-            fprintf (stderr, "oss: failed to write buffer\n");
-        }
-        usleep (1000); // this must be here to prevent mutex deadlock
+            fprintf (stderr, "jack: failed to write buffer %i - %i\n",res,write_size);
+        } 
+	//	usleep (5600);
+	usleep (jack_blocksize * 1000000 / pjack_rate /8);
+	//	usleep (2822);
     }
 }
 
 static int
-oss_callback (char *stream, int len) {
+pjack_callback (char *stream, int len) {
     int bytesread = deadbeef->streamer_read (stream, len);
-    int16_t ivolume = deadbeef->volume_get_amp () * 1000;
+    /*   int16_t ivolume = deadbeef->volume_get_amp () * 1000;
     for (int i = 0; i < bytesread/2; i++) {
         ((int16_t*)stream)[i] = (int16_t)(((int32_t)(((int16_t*)stream)[i])) * ivolume / 1000);
-    }
+	}*/
 
     return bytesread;
 }
 
 static int
-oss_get_state (void) {
+pjack_get_state (void) {
     return state;
 }
 
 static int
-oss_plugin_start (void) {
+pjack_plugin_start (void) {
+  /*   JACK_Init();
+       JACK_SetClientName("deadbeef");*/
     return 0;
 }
 
 static int
-oss_plugin_stop (void) {
+pjack_plugin_stop (void) {
+  /*    JACK_Close(jack_device);*/
     return 0;
 }
 
 DB_plugin_t *
-oss_load (DB_functions_t *api) {
+jack_load (DB_functions_t *api) {
     deadbeef = api;
     return DB_PLUGIN (&plugin);
 }
@@ -308,24 +293,24 @@ static DB_output_t plugin = {
     .plugin.version_minor = 1,
     .plugin.nostop = 0,
     .plugin.type = DB_PLUGIN_OUTPUT,
-    .plugin.id = "oss",
-    .plugin.name = "OSS output plugin",
-    .plugin.descr = "plays sound via OSS API",
-    .plugin.author = "Alexey Yakovenko",
-    .plugin.email = "waker@users.sourceforge.net",
+    .plugin.id = "jack",
+    .plugin.name = "Jack output plugin",
+    .plugin.descr = "plays sound via Jack API",
+    .plugin.author = "Dmitry Klimov",
+    .plugin.email = "lazyklimm@gmail.com",
     .plugin.website = "http://deadbeef.sf.net",
-    .plugin.start = oss_plugin_start,
-    .plugin.stop = oss_plugin_stop,
-    .init = oss_init,
-    .free = oss_free,
-    .change_rate = oss_change_rate,
-    .play = oss_play,
-    .stop = oss_stop,
-    .pause = oss_pause,
-    .unpause = oss_unpause,
-    .state = oss_get_state,
-    .samplerate = oss_get_rate,
-    .bitspersample = oss_get_bps,
-    .channels = oss_get_channels,
-    .endianness = oss_get_endianness,
+    .plugin.start = pjack_plugin_start,
+    .plugin.stop = pjack_plugin_stop,
+    .init = pjack_init,
+    .free = pjack_free,
+    .change_rate = pjack_change_rate,
+    .play = pjack_play,
+    .stop = pjack_stop,
+    .pause = pjack_pause,
+    .unpause = pjack_unpause,
+    .state = pjack_get_state,
+    .samplerate = pjack_get_rate,
+    .bitspersample = pjack_get_bps,
+    .channels = pjack_get_channels,
+    .endianness = pjack_get_endianness,
 };
